@@ -1,0 +1,10 @@
+streamlit>=1.38
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
+alpaca-trade-api>=3.0.0
+python-dotenv>=1.0.1
+PyYAML>=6.0.2
+ccxt>=4.3.98
+pytz>=2024.1
+matplotlib>=3.8
