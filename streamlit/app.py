@@ -20,12 +20,18 @@ STOCK_UNIVERSE = [
     "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV",
 ]
 
-# Major & meme crypto that Yahoo Finance supports
+# Crypto universe limited to tickers Yahoo Finance actually supports
 CRYPTO_UNIVERSE = [
-    # Majors
-    "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD",
-    # Meme / degen
-    "DOGE-USD", "SHIB-USD", "PEPE-USD", "BONK-USD",
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "BNB-USD",
+    "XRP-USD",
+    "DOGE-USD",
+    "SHIB-USD",
+    "ADA-USD",
+    "AVAX-USD",
+    "DOT-USD",
 ]
 
 # -------------------
@@ -38,38 +44,54 @@ def load_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.D
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if df.empty:
         return df
+    # Normalize columns and index
     df = df.rename(columns=str.lower)
-    df.index = df.index.tz_localize(None) if hasattr(df.index, "tz_localize") else df.index
+    try:
+        df.index = df.index.tz_localize(None)
+    except Exception:
+        pass
     return df
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add technical indicators: SMAs, RSI, ATR, volume avg."""
-    if df.empty:
-        return df.copy()
+    """Add technical indicators safely (RSI, SMAs, ATR, volume MA)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required_cols = {"close", "high", "low"}
+    if not required_cols.issubset(set(df.columns)):
+        return pd.DataFrame()
 
     df = df.copy()
 
+    # Ensure 1D float series
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+
     # Simple moving averages
-    df["sma20"] = df["close"].rolling(20).mean()
-    df["sma50"] = df["close"].rolling(50).mean()
-    df["sma200"] = df["close"].rolling(200).mean()
+    df["sma20"] = close.rolling(20).mean()
+    df["sma50"] = close.rolling(50).mean()
+    df["sma200"] = close.rolling(200).mean()
 
     # RSI 14
-    delta = df["close"].diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    roll_up = pd.Series(gain).rolling(14).mean()
-    roll_down = pd.Series(loss).rolling(14).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    roll_up = gain.rolling(14).mean()
+    roll_down = loss.rolling(14).mean()
     rs = roll_up / (roll_down + 1e-9)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    df["rsi14"] = rsi.values
+    df["rsi14"] = 100.0 - (100.0 / (1.0 + rs))
 
     # ATR 14
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    tr = pd.DataFrame(
+        {
+            "hl": high - low,
+            "hc": (high - close.shift()).abs(),
+            "lc": (low - close.shift()).abs(),
+        }
+    ).max(axis=1)
     df["atr14"] = tr.rolling(14).mean()
 
     # Volume 20-day average
@@ -98,7 +120,7 @@ def classify_trend(last_close, sma20, sma50, sma200) -> str:
 
 def generate_signal_row(symbol: str, df: pd.DataFrame, capital: float, risk_pct: float):
     """Generate a single row of signal info for scanner."""
-    if df.empty or len(df) < 30:
+    if df is None or df.empty or len(df) < 30:
         return None
 
     last = df.iloc[-1]
@@ -139,7 +161,8 @@ def generate_signal_row(symbol: str, df: pd.DataFrame, capital: float, risk_pct:
         risk_dollars = 0
     else:
         risk_dollars = capital * risk_pct
-        position_size = risk_dollars / (last_close - stop_loss) if (last_close - stop_loss) > 0 else 0
+        denom = (last_close - stop_loss)
+        position_size = risk_dollars / denom if denom > 0 else 0
 
     return {
         "Symbol": symbol,
@@ -162,12 +185,15 @@ def simple_backtest_momentum(df: pd.DataFrame):
     - Exit when price closes below SMA20 or RSI < 50
     Uses daily data; returns rough stats.
     """
-    if df.empty or len(df) < 60:
+    if df is None or df.empty or len(df) < 60:
         return {"Trades": 0, "Win %": np.nan, "Avg R": np.nan, "Total R": np.nan}
 
     df = df.copy()
     df = compute_indicators(df)
     df = df.dropna(subset=["sma20", "sma50", "sma200", "rsi14"])
+
+    if df.empty:
+        return {"Trades": 0, "Win %": np.nan, "Avg R": np.nan, "Total R": np.nan}
 
     in_trade = False
     entry_price = None
@@ -180,9 +206,9 @@ def simple_backtest_momentum(df: pd.DataFrame):
         # Build a "momentum signal" condition like in scanner
         trend = classify_trend(row_prev["close"], row_prev["sma20"], row_prev["sma50"], row_prev["sma200"])
         momentum_cond = (
-            trend.startswith("Strong Uptrend") and
-            55 <= row_prev["rsi14"] <= 75 and
-            row_prev["close"] > row_prev["close"] * 0.995  # just to avoid flat days
+            trend.startswith("Strong Uptrend")
+            and 55 <= row_prev["rsi14"] <= 75
+            and row_prev["close"] > row_prev["close"] * 0.995  # avoid flat days
         )
 
         if not in_trade and momentum_cond:
@@ -280,11 +306,19 @@ with tab_scan:
 
             try:
                 df = load_history(sym, period=period, interval=interval)
+
+                # Skip invalid / empty data frames
+                if df is None or df.empty or "close" not in df.columns:
+                    continue
+
                 df = compute_indicators(df)
+                if df is None or df.empty:
+                    continue
+
                 row = generate_signal_row(sym, df, capital, risk_pct)
                 if row:
                     rows.append(row)
-            except Exception as e:
+            except Exception:
                 # Skip symbols that fail
                 continue
 
@@ -296,12 +330,14 @@ with tab_scan:
         else:
             df_signals = pd.DataFrame(rows)
             # Sort: Momentum Long first, then by 1D %
-            df_signals["SignalRank"] = df_signals["Signal"].map({
-                "Momentum Long": 0,
-                "Oversold Watch": 1,
-                "Avoid / Short Bias": 2,
-                "No Trade": 3,
-            }).fillna(4)
+            df_signals["SignalRank"] = df_signals["Signal"].map(
+                {
+                    "Momentum Long": 0,
+                    "Oversold Watch": 1,
+                    "Avoid / Short Bias": 2,
+                    "No Trade": 3,
+                }
+            ).fillna(4)
 
             df_signals = df_signals.sort_values(["SignalRank", "1D %"], ascending=[True, False])
 
@@ -311,10 +347,8 @@ with tab_scan:
             )
 
             st.caption("Signals are NOT financial advice. Use them as a starting point, not as blind orders.")
-
     else:
         st.info("Configure settings in the sidebar and click **Run Scan** to analyze the market.")
-
 
 # -------------------
 # SYMBOL DETAIL TAB
@@ -328,39 +362,41 @@ with tab_detail:
 
     if st.button("Analyze Symbol"):
         df = load_history(symbol, period=period, interval=interval)
-        if df.empty:
+        if df is None or df.empty:
             st.error("No data for that symbol / timeframe.")
         else:
             df = compute_indicators(df)
-            last = df.iloc[-1]
+            if df.empty:
+                st.error("Not enough data to compute indicators.")
+            else:
+                last = df.iloc[-1]
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Last Price", f"{last['close']:.4f}")
-                st.metric("RSI 14", f"{last['rsi14']:.1f}")
-            with col2:
-                st.metric("SMA20", f"{last['sma20']:.4f}")
-                st.metric("SMA50", f"{last['sma50']:.4f}")
-            with col3:
-                st.metric("SMA200", f"{last['sma200']:.4f}")
-                st.metric("ATR14", f"{last['atr14']:.4f}")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Last Price", f"{last['close']:.4f}")
+                    st.metric("RSI 14", f"{last['rsi14']:.1f}")
+                with col2:
+                    st.metric("SMA20", f"{last['sma20']:.4f}")
+                    st.metric("SMA50", f"{last['sma50']:.4f}")
+                with col3:
+                    st.metric("SMA200", f"{last['sma200']:.4f}")
+                    st.metric("ATR14", f"{last['atr14']:.4f}")
 
-            st.line_chart(df[["close", "sma20", "sma50", "sma200"]].dropna())
+                st.line_chart(df[["close", "sma20", "sma50", "sma200"]].dropna())
 
-            # Backtest
-            stats = simple_backtest_momentum(df)
-            st.markdown("### Simple Momentum Backtest (daily data)")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades", stats["Trades"])
-            c2.metric("Win %", f"{stats['Win %'] if stats['Win %'] == stats['Win %'] else 'N/A'}")
-            c3.metric("Avg R/Trade", f"{stats['Avg R'] if stats['Avg R'] == stats['Avg R'] else 'N/A'}")
-            c4.metric("Total R", f"{stats['Total R'] if stats['Total R'] == stats['Total R'] else 'N/A'}")
+                # Backtest
+                stats = simple_backtest_momentum(df)
+                st.markdown("### Simple Momentum Backtest (daily data)")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Trades", stats["Trades"])
+                c2.metric("Win %", f"{stats['Win %'] if stats['Win %'] == stats['Win %'] else 'N/A'}")
+                c3.metric("Avg R/Trade", f"{stats['Avg R'] if stats['Avg R'] == stats['Avg R'] else 'N/A'}")
+                c4.metric("Total R", f"{stats['Total R'] if stats['Total R'] == stats['Total R'] else 'N/A'}")
 
-            st.caption(
-                "Backtest is rough & simplified. It uses a basic momentum rule set and does not account for slippage, "
-                "fees, or intraday behavior."
-            )
-
+                st.caption(
+                    "Backtest is rough & simplified. It uses a basic momentum rule set and does not account for "
+                    "slippage, fees, or intraday behavior."
+                )
 
 # -------------------
 # HELP TAB
@@ -369,7 +405,8 @@ with tab_detail:
 with tab_help:
     st.subheader("What This Bot Actually Does")
 
-    st.markdown("""
+    st.markdown(
+        """
     **This app is an analysis & idea-generation bot, not an auto-trading bot.**
 
     **Scanner tab**
@@ -392,4 +429,5 @@ with tab_help:
     - This is **not** financial advice.
     - Use it as a starting point to focus your attention, not as an autopilot money machine.
     - Real edge comes from testing, discipline, and risk management, not a single script.
-    """)
+    """
+    )
